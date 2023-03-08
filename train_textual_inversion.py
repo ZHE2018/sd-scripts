@@ -11,7 +11,11 @@ import diffusers
 from diffusers import DDPMScheduler
 
 import library.train_util as train_util
-from library.train_util import DreamBoothDataset, FineTuningDataset
+import library.config_util as config_util
+from library.config_util import (
+  ConfigSanitizer,
+  BlueprintGenerator,
+)
 
 imagenet_templates_small = [
     "a photo of a {}",
@@ -79,7 +83,6 @@ def train(args):
   train_util.prepare_dataset_args(args, True)
 
   cache_latents = args.cache_latents
-  use_dreambooth_method = args.in_json is None
 
   if args.seed is not None:
     set_seed(args.seed)
@@ -139,21 +142,35 @@ def train(args):
   print(f"create embeddings for {args.num_vectors_per_token} tokens, for {args.token_string}")
 
   # データセットを準備する
-  if use_dreambooth_method:
-    print("Use DreamBooth method.")
-    train_dataset = DreamBoothDataset(args.train_batch_size, args.train_data_dir, args.reg_data_dir,
-                                      tokenizer, args.max_token_length, args.caption_extension, args.shuffle_caption, args.keep_tokens,
-                                      args.resolution, args.enable_bucket, args.min_bucket_reso, args.max_bucket_reso,
-                                      args.bucket_reso_steps, args.bucket_no_upscale,
-                                      args.prior_loss_weight, args.flip_aug, args.color_aug, args.face_crop_aug_range, args.random_crop, args.debug_dataset)
+  blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, False))
+  if args.dataset_config is not None:
+    print(f"Load dataset config from {args.dataset_config}")
+    user_config = config_util.load_user_config(args.dataset_config)
+    ignored = ["train_data_dir", "reg_data_dir", "in_json"]
+    if any(getattr(args, attr) is not None for attr in ignored):
+      print("ignore following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(', '.join(ignored)))
   else:
-    print("Train with captions.")
-    train_dataset = FineTuningDataset(args.in_json, args.train_batch_size, args.train_data_dir,
-                                      tokenizer, args.max_token_length, args.shuffle_caption, args.keep_tokens,
-                                      args.resolution, args.enable_bucket, args.min_bucket_reso, args.max_bucket_reso,
-                                      args.bucket_reso_steps, args.bucket_no_upscale,
-                                      args.flip_aug, args.color_aug, args.face_crop_aug_range, args.random_crop,
-                                      args.dataset_repeats, args.debug_dataset)
+    use_dreambooth_method = args.in_json is None
+    if use_dreambooth_method:
+      print("Use DreamBooth method.")
+      user_config = {
+        "datasets": [{
+          "subsets": config_util.generate_dreambooth_subsets_config_by_subdirs(args.train_data_dir, args.reg_data_dir)
+        }]
+      }
+    else:
+      print("Train with captions.")
+      user_config = {
+        "datasets": [{
+          "subsets": [{
+            "image_dir": args.train_data_dir,
+            "metadata_file": args.in_json,
+          }]
+        }]
+      }
+
+  blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
+  train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
   # make captions: tokenstring tokenstring1 tokenstring2 ...tokenstringn という文字列に書き換える超乱暴な実装
   if use_template:
@@ -163,19 +180,24 @@ def train(args):
     captions = []
     for tmpl in templates:
       captions.append(tmpl.format(replace_to))
-    train_dataset.add_replacement("", captions)
-  elif args.num_vectors_per_token > 1:
-    replace_to = " ".join(token_strings)
-    train_dataset.add_replacement(args.token_string, replace_to)
-
-  train_dataset.make_buckets()
+    train_dataset_group.add_replacement("", captions)
+  else:
+    if args.num_vectors_per_token > 1:
+      replace_to = " ".join(token_strings)
+      train_dataset_group.add_replacement(args.token_string, replace_to)
+      prompt_replacement = (args.token_string, replace_to)
+    else:
+      prompt_replacement = None
 
   if args.debug_dataset:
-    train_util.debug_dataset(train_dataset, show_input_ids=True)
+    train_util.debug_dataset(train_dataset_group, show_input_ids=True)
     return
-  if len(train_dataset) == 0:
+  if len(train_dataset_group) == 0:
     print("No data found. Please verify arguments / 画像がありません。引数指定を確認してください")
     return
+
+  if cache_latents:
+    assert train_dataset_group.is_latent_cacheable(), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
 
   # モデルに xformers とか memory efficient attention を組み込む
   train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers)
@@ -186,7 +208,7 @@ def train(args):
     vae.requires_grad_(False)
     vae.eval()
     with torch.no_grad():
-      train_dataset.cache_latents(vae)
+      train_dataset_group.cache_latents(vae)
     vae.to("cpu")
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
@@ -198,35 +220,14 @@ def train(args):
 
   # 学習に必要なクラスを準備する
   print("prepare optimizer, data loader etc.")
-
-  # 8-bit Adamを使う
-  if args.use_8bit_adam:
-    try:
-      import bitsandbytes as bnb
-    except ImportError:
-      raise ImportError("No bitsand bytes / bitsandbytesがインストールされていないようです")
-    print("use 8-bit Adam optimizer")
-    optimizer_class = bnb.optim.AdamW8bit
-  elif args.use_lion_optimizer:
-    try:
-      import lion_pytorch
-    except ImportError:
-      raise ImportError("No lion_pytorch / lion_pytorch がインストールされていないようです")
-    print("use Lion optimizer")
-    optimizer_class = lion_pytorch.Lion
-  else:
-    optimizer_class = torch.optim.AdamW
-
   trainable_params = text_encoder.get_input_embeddings().parameters()
-
-  # betaやweight decayはdiffusers DreamBoothもDreamBooth SDもデフォルト値のようなのでオプションはとりあえず省略
-  optimizer = optimizer_class(trainable_params, lr=args.learning_rate)
+  _, _, optimizer = train_util.get_optimizer(args, trainable_params)
 
   # dataloaderを準備する
   # DataLoaderのプロセス数：0はメインプロセスになる
   n_workers = min(args.max_data_loader_n_workers, os.cpu_count() - 1)      # cpu_count-1 ただし最大で指定された数まで
   train_dataloader = torch.utils.data.DataLoader(
-      train_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=n_workers, persistent_workers=args.persistent_data_loader_workers)
+      train_dataset_group, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=n_workers, persistent_workers=args.persistent_data_loader_workers)
 
   # 学習ステップ数を計算する
   if args.max_train_epochs is not None:
@@ -234,8 +235,9 @@ def train(args):
     print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
 
   # lr schedulerを用意する
-  lr_scheduler = diffusers.optimization.get_scheduler(
-      args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps * args.gradient_accumulation_steps)
+  lr_scheduler = train_util.get_scheduler_fix(args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
+                                              num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+                                              num_cycles=args.lr_scheduler_num_cycles, power=args.lr_scheduler_power)
 
   # acceleratorがなんかよろしくやってくれるらしい
   text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -283,8 +285,8 @@ def train(args):
   # 学習する
   total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
   print("running training / 学習開始")
-  print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset.num_train_images}")
-  print(f"  num reg images / 正則化画像の数: {train_dataset.num_reg_images}")
+  print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset_group.num_train_images}")
+  print(f"  num reg images / 正則化画像の数: {train_dataset_group.num_reg_images}")
   print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
   print(f"  num epochs / epoch数: {num_train_epochs}")
   print(f"  batch size per device / バッチサイズ: {args.train_batch_size}")
@@ -303,12 +305,11 @@ def train(args):
 
   for epoch in range(num_train_epochs):
     print(f"epoch {epoch+1}/{num_train_epochs}")
-    train_dataset.set_current_epoch(epoch + 1)
+    train_dataset_group.set_current_epoch(epoch + 1)
 
     text_encoder.train()
 
     loss_total = 0
-    bef_epo_embs = unwrap_model(text_encoder).get_input_embeddings().weight[token_ids].data.detach().clone()
     for step, batch in enumerate(train_dataloader):
       with accelerator.accumulate(text_encoder):
         with torch.no_grad():
@@ -357,9 +358,9 @@ def train(args):
         loss = loss.mean()                # 平均なのでbatch_sizeで割る必要なし
 
         accelerator.backward(loss)
-        if accelerator.sync_gradients:
+        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
           params_to_clip = text_encoder.get_input_embeddings().parameters()
-          accelerator.clip_grad_norm_(params_to_clip, 1.0)  # args.max_grad_norm)
+          accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
         optimizer.step()
         lr_scheduler.step()
@@ -374,9 +375,14 @@ def train(args):
         progress_bar.update(1)
         global_step += 1
 
+        train_util.sample_images(accelerator, args, None, global_step, accelerator.device,
+                                 vae, tokenizer, text_encoder, unet, prompt_replacement)
+
       current_loss = loss.detach().item()
       if args.logging_dir is not None:
-        logs = {"loss": current_loss, "lr": lr_scheduler.get_last_lr()[0]}
+        logs = {"loss": current_loss, "lr": float(lr_scheduler.get_last_lr()[0])}
+        if args.optimizer_type.lower() == "DAdaptation".lower():  # tracking d*lr value
+          logs["lr/d*lr"] = lr_scheduler.optimizers[0].param_groups[0]['d']*lr_scheduler.optimizers[0].param_groups[0]['lr']
         accelerator.log(logs, step=global_step)
 
       loss_total += current_loss
@@ -394,8 +400,6 @@ def train(args):
     accelerator.wait_for_everyone()
 
     updated_embs = unwrap_model(text_encoder).get_input_embeddings().weight[token_ids].data.detach().clone()
-    # d = updated_embs - bef_epo_embs
-    # print(bef_epo_embs.size(), updated_embs.size(), d.mean(), d.min())
 
     if args.save_every_n_epochs is not None:
       model_name = train_util.DEFAULT_EPOCH_NAME if args.output_name is None else args.output_name
@@ -416,6 +420,9 @@ def train(args):
       saving = train_util.save_on_epoch_end(args, save_func, remove_old_func, epoch + 1, num_train_epochs)
       if saving and args.save_state:
         train_util.save_state_on_epoch_end(args, accelerator, model_name, epoch + 1)
+
+    train_util.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device,
+                             vae, tokenizer, text_encoder, unet, prompt_replacement)
 
     # end of epoch
 
@@ -491,6 +498,8 @@ if __name__ == '__main__':
   train_util.add_sd_models_arguments(parser)
   train_util.add_dataset_arguments(parser, True, True, False)
   train_util.add_training_arguments(parser, True)
+  train_util.add_optimizer_arguments(parser)
+  config_util.add_config_arguments(parser)
 
   parser.add_argument("--save_model_as", type=str, default="pt", choices=[None, "ckpt", "pt", "safetensors"],
                       help="format to save the model (default is .pt) / モデル保存時の形式（デフォルトはpt）")

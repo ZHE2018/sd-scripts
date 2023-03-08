@@ -1,8 +1,4 @@
-from diffusers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
-from torch.optim import Optimizer
-from torch.cuda.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
-from typing import Optional, Union
 import importlib
 import argparse
 import gc
@@ -15,92 +11,39 @@ import json
 from tqdm import tqdm
 import torch
 from accelerate.utils import set_seed
-import diffusers
 from diffusers import DDPMScheduler
 
 import library.train_util as train_util
-from library.train_util import DreamBoothDataset, FineTuningDataset
+from library.train_util import (
+    DreamBoothDataset,
+)
+import library.config_util as config_util
+from library.config_util import (
+    ConfigSanitizer,
+    BlueprintGenerator,
+)
 
 
 def collate_fn(examples):
   return examples[0]
 
 
+# TODO 他のスクリプトと共通化する
 def generate_step_logs(args: argparse.Namespace, current_loss, avr_loss, lr_scheduler):
   logs = {"loss/current": current_loss, "loss/average": avr_loss}
 
   if args.network_train_unet_only:
-    logs["lr/unet"] = lr_scheduler.get_last_lr()[0]
+    logs["lr/unet"] = float(lr_scheduler.get_last_lr()[0])
   elif args.network_train_text_encoder_only:
-    logs["lr/textencoder"] = lr_scheduler.get_last_lr()[0]
+    logs["lr/textencoder"] = float(lr_scheduler.get_last_lr()[0])
   else:
-    logs["lr/textencoder"] = lr_scheduler.get_last_lr()[0]
-    logs["lr/unet"] = lr_scheduler.get_last_lr()[-1]          # may be same to textencoder
+    logs["lr/textencoder"] = float(lr_scheduler.get_last_lr()[0])
+    logs["lr/unet"] = float(lr_scheduler.get_last_lr()[-1])          # may be same to textencoder
+
+  if args.optimizer_type.lower() == "DAdaptation".lower():  # tracking d*lr value of unet.
+    logs["lr/d*lr"] = lr_scheduler.optimizers[-1].param_groups[0]['d']*lr_scheduler.optimizers[-1].param_groups[0]['lr']
 
   return logs
-
-
-# Monkeypatch newer get_scheduler() function overridng current version of diffusers.optimizer.get_scheduler
-# code is taken from https://github.com/huggingface/diffusers diffusers.optimizer, commit d87cc15977b87160c30abaace3894e802ad9e1e6
-# Which is a newer release of diffusers than currently packaged with sd-scripts
-# This code can be removed when newer diffusers version (v0.12.1 or greater) is tested and implemented to sd-scripts
-
-
-def get_scheduler_fix(
-    name: Union[str, SchedulerType],
-    optimizer: Optimizer,
-    num_warmup_steps: Optional[int] = None,
-    num_training_steps: Optional[int] = None,
-    num_cycles: int = 1,
-    power: float = 1.0,
-):
-  """
-  Unified API to get any scheduler from its name.
-  Args:
-      name (`str` or `SchedulerType`):
-          The name of the scheduler to use.
-      optimizer (`torch.optim.Optimizer`):
-          The optimizer that will be used during training.
-      num_warmup_steps (`int`, *optional*):
-          The number of warmup steps to do. This is not required by all schedulers (hence the argument being
-          optional), the function will raise an error if it's unset and the scheduler type requires it.
-      num_training_steps (`int``, *optional*):
-          The number of training steps to do. This is not required by all schedulers (hence the argument being
-          optional), the function will raise an error if it's unset and the scheduler type requires it.
-      num_cycles (`int`, *optional*):
-          The number of hard restarts used in `COSINE_WITH_RESTARTS` scheduler.
-      power (`float`, *optional*, defaults to 1.0):
-          Power factor. See `POLYNOMIAL` scheduler
-      last_epoch (`int`, *optional*, defaults to -1):
-          The index of the last epoch when resuming training.
-  """
-  name = SchedulerType(name)
-  schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
-  if name == SchedulerType.CONSTANT:
-    return schedule_func(optimizer)
-
-  # All other schedulers require `num_warmup_steps`
-  if num_warmup_steps is None:
-    raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
-
-  if name == SchedulerType.CONSTANT_WITH_WARMUP:
-    return schedule_func(optimizer, num_warmup_steps=num_warmup_steps)
-
-  # All other schedulers require `num_training_steps`
-  if num_training_steps is None:
-    raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
-
-  if name == SchedulerType.COSINE_WITH_RESTARTS:
-    return schedule_func(
-        optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, num_cycles=num_cycles
-    )
-
-  if name == SchedulerType.POLYNOMIAL:
-    return schedule_func(
-        optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power
-    )
-
-  return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
 
 def train(args):
@@ -111,6 +54,7 @@ def train(args):
 
   cache_latents = args.cache_latents
   use_dreambooth_method = args.in_json is None
+  use_user_config = args.dataset_config is not None
 
   if args.seed is not None:
     set_seed(args.seed)
@@ -118,34 +62,46 @@ def train(args):
   tokenizer = train_util.load_tokenizer(args)
 
   # データセットを準備する
-  if use_dreambooth_method:
-    print("Use DreamBooth method.")
-    train_dataset = DreamBoothDataset(args.train_batch_size, args.train_data_dir, args.reg_data_dir,
-                                      tokenizer, args.max_token_length, args.caption_extension, args.shuffle_caption, args.keep_tokens,
-                                      args.resolution, args.enable_bucket, args.min_bucket_reso, args.max_bucket_reso,
-                                      args.bucket_reso_steps, args.bucket_no_upscale,
-                                      args.prior_loss_weight, args.flip_aug, args.color_aug, args.face_crop_aug_range,
-                                      args.random_crop, args.debug_dataset)
+  blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, True))
+  if use_user_config:
+    print(f"Load dataset config from {args.dataset_config}")
+    user_config = config_util.load_user_config(args.dataset_config)
+    ignored = ["train_data_dir", "reg_data_dir", "in_json"]
+    if any(getattr(args, attr) is not None for attr in ignored):
+      print(
+          "ignore following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(', '.join(ignored)))
   else:
-    print("Train with captions.")
-    train_dataset = FineTuningDataset(args.in_json, args.train_batch_size, args.train_data_dir,
-                                      tokenizer, args.max_token_length, args.shuffle_caption, args.keep_tokens,
-                                      args.resolution, args.enable_bucket, args.min_bucket_reso, args.max_bucket_reso,
-                                      args.bucket_reso_steps, args.bucket_no_upscale,
-                                      args.flip_aug, args.color_aug, args.face_crop_aug_range, args.random_crop,
-                                      args.dataset_repeats, args.debug_dataset)
+    if use_dreambooth_method:
+      print("Use DreamBooth method.")
+      user_config = {
+          "datasets": [{
+              "subsets": config_util.generate_dreambooth_subsets_config_by_subdirs(args.train_data_dir, args.reg_data_dir)
+          }]
+      }
+    else:
+      print("Train with captions.")
+      user_config = {
+          "datasets": [{
+              "subsets": [{
+                  "image_dir": args.train_data_dir,
+                  "metadata_file": args.in_json,
+              }]
+          }]
+      }
 
-  # 学習データのdropout率を設定する
-  train_dataset.set_caption_dropout(args.caption_dropout_rate, args.caption_dropout_every_n_epochs, args.caption_tag_dropout_rate)
-
-  train_dataset.make_buckets()
+  blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
+  train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
   if args.debug_dataset:
-    train_util.debug_dataset(train_dataset)
+    train_util.debug_dataset(train_dataset_group)
     return
-  if len(train_dataset) == 0:
+  if len(train_dataset_group) == 0:
     print("No data found. Please verify arguments (train_data_dir must be the parent of folders with images) / 画像がありません。引数指定を確認してください（train_data_dirには画像があるフォルダではなく、画像があるフォルダの親フォルダを指定する必要があります）")
     return
+
+  if cache_latents:
+    assert train_dataset_group.is_latent_cacheable(
+    ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
 
   # acceleratorを準備する
   print("prepare accelerator")
@@ -161,7 +117,7 @@ def train(args):
   if args.lowram:
     text_encoder.to("cuda")
     unet.to("cuda")
-  
+
   # モデルに xformers とか memory efficient attention を組み込む
   train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers)
 
@@ -171,7 +127,7 @@ def train(args):
     vae.requires_grad_(False)
     vae.eval()
     with torch.no_grad():
-      train_dataset.cache_latents(vae)
+      train_dataset_group.cache_latents(vae)
     vae.to("cpu")
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
@@ -208,36 +164,14 @@ def train(args):
   # 学習に必要なクラスを準備する
   print("prepare optimizer, data loader etc.")
 
-  # 8-bit Adamを使う
-  if args.use_8bit_adam:
-    try:
-      import bitsandbytes as bnb
-    except ImportError:
-      raise ImportError("No bitsand bytes / bitsandbytesがインストールされていないようです")
-    print("use 8-bit Adam optimizer")
-    optimizer_class = bnb.optim.AdamW8bit
-  elif args.use_lion_optimizer:
-    try:
-      import lion_pytorch
-    except ImportError:
-      raise ImportError("No lion_pytorch / lion_pytorch がインストールされていないようです")
-    print("use Lion optimizer")
-    optimizer_class = lion_pytorch.Lion
-  else:
-    optimizer_class = torch.optim.AdamW
-
-  optimizer_name = optimizer_class.__module__ + "." + optimizer_class.__name__
-
   trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
-
-  # betaやweight decayはdiffusers DreamBoothもDreamBooth SDもデフォルト値のようなのでオプションはとりあえず省略
-  optimizer = optimizer_class(trainable_params, lr=args.learning_rate)
+  optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
   # dataloaderを準備する
   # DataLoaderのプロセス数：0はメインプロセスになる
   n_workers = min(args.max_data_loader_n_workers, os.cpu_count() - 1)      # cpu_count-1 ただし最大で指定された数まで
   train_dataloader = torch.utils.data.DataLoader(
-      train_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=n_workers, persistent_workers=args.persistent_data_loader_workers)
+      train_dataset_group, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=n_workers, persistent_workers=args.persistent_data_loader_workers)
 
   # 学習ステップ数を計算する
   if args.max_train_epochs is not None:
@@ -245,11 +179,9 @@ def train(args):
     print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
 
   # lr schedulerを用意する
-  # lr_scheduler = diffusers.optimization.get_scheduler(
-  lr_scheduler = get_scheduler_fix(
-      args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
-      num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-      num_cycles=args.lr_scheduler_num_cycles, power=args.lr_scheduler_power)
+  lr_scheduler = train_util.get_scheduler_fix(args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
+                                              num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+                                              num_cycles=args.lr_scheduler_num_cycles, power=args.lr_scheduler_power)
 
   # 実験的機能：勾配も含めたfp16学習を行う　モデル全体をfp16にする
   if args.full_fp16:
@@ -317,17 +249,19 @@ def train(args):
     args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
   # 学習する
+  # TODO: find a way to handle total batch size when there are multiple datasets
   total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
   print("running training / 学習開始")
-  print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset.num_train_images}")
-  print(f"  num reg images / 正則化画像の数: {train_dataset.num_reg_images}")
+  print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset_group.num_train_images}")
+  print(f"  num reg images / 正則化画像の数: {train_dataset_group.num_reg_images}")
   print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
   print(f"  num epochs / epoch数: {num_train_epochs}")
-  print(f"  batch size per device / バッチサイズ: {args.train_batch_size}")
-  print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
+  print(f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}")
+  # print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
   print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
   print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
+  # TODO refactor metadata creation and move to util
   metadata = {
       "ss_session_id": session_id,            # random integer indicating which group of epochs the model came from
       "ss_training_started_at": training_started_at,          # unix timestamp
@@ -335,12 +269,10 @@ def train(args):
       "ss_learning_rate": args.learning_rate,
       "ss_text_encoder_lr": args.text_encoder_lr,
       "ss_unet_lr": args.unet_lr,
-      "ss_num_train_images": train_dataset.num_train_images,          # includes repeating
-      "ss_num_reg_images": train_dataset.num_reg_images,
+      "ss_num_train_images": train_dataset_group.num_train_images,
+      "ss_num_reg_images": train_dataset_group.num_reg_images,
       "ss_num_batches_per_epoch": len(train_dataloader),
       "ss_num_epochs": num_train_epochs,
-      "ss_batch_size_per_device": args.train_batch_size,
-      "ss_total_batch_size": total_batch_size,
       "ss_gradient_checkpointing": args.gradient_checkpointing,
       "ss_gradient_accumulation_steps": args.gradient_accumulation_steps,
       "ss_max_train_steps": args.max_train_steps,
@@ -352,28 +284,148 @@ def train(args):
       "ss_mixed_precision": args.mixed_precision,
       "ss_full_fp16": bool(args.full_fp16),
       "ss_v2": bool(args.v2),
-      "ss_resolution": args.resolution,
       "ss_clip_skip": args.clip_skip,
       "ss_max_token_length": args.max_token_length,
-      "ss_color_aug": bool(args.color_aug),
-      "ss_flip_aug": bool(args.flip_aug),
-      "ss_random_crop": bool(args.random_crop),
-      "ss_shuffle_caption": bool(args.shuffle_caption),
       "ss_cache_latents": bool(args.cache_latents),
-      "ss_enable_bucket": bool(train_dataset.enable_bucket),
-      "ss_min_bucket_reso": train_dataset.min_bucket_reso,
-      "ss_max_bucket_reso": train_dataset.max_bucket_reso,
       "ss_seed": args.seed,
-      "ss_keep_tokens": args.keep_tokens,
+      "ss_lowram": args.lowram,
       "ss_noise_offset": args.noise_offset,
-      "ss_dataset_dirs": json.dumps(train_dataset.dataset_dirs_info),
-      "ss_reg_dataset_dirs": json.dumps(train_dataset.reg_dataset_dirs_info),
-      "ss_tag_frequency": json.dumps(train_dataset.tag_frequency),
-      "ss_bucket_info": json.dumps(train_dataset.bucket_info),
       "ss_training_comment": args.training_comment,       # will not be updated after training
       "ss_sd_scripts_commit_hash": train_util.get_git_revision_hash(),
-      "ss_optimizer": optimizer_name
+      "ss_optimizer": optimizer_name + (f"({optimizer_args})" if len(optimizer_args) > 0 else ""),
+      "ss_max_grad_norm": args.max_grad_norm,
+      "ss_caption_dropout_rate": args.caption_dropout_rate,
+      "ss_caption_dropout_every_n_epochs": args.caption_dropout_every_n_epochs,
+      "ss_caption_tag_dropout_rate": args.caption_tag_dropout_rate,
+      "ss_face_crop_aug_range": args.face_crop_aug_range,
+      "ss_prior_loss_weight": args.prior_loss_weight,
   }
+
+  if use_user_config:
+    # save metadata of multiple datasets
+    # NOTE: pack "ss_datasets" value as json one time
+    #   or should also pack nested collections as json?
+    datasets_metadata = []
+    tag_frequency = {}                    # merge tag frequency for metadata editor
+    dataset_dirs_info = {}                # merge subset dirs for metadata editor
+
+    for dataset in train_dataset_group.datasets:
+      is_dreambooth_dataset = isinstance(dataset, DreamBoothDataset)
+      dataset_metadata = {
+          "is_dreambooth": is_dreambooth_dataset,
+          "batch_size_per_device": dataset.batch_size,
+          "num_train_images": dataset.num_train_images,          # includes repeating
+          "num_reg_images": dataset.num_reg_images,
+          "resolution": (dataset.width, dataset.height),
+          "enable_bucket": bool(dataset.enable_bucket),
+          "min_bucket_reso": dataset.min_bucket_reso,
+          "max_bucket_reso": dataset.max_bucket_reso,
+          "tag_frequency": dataset.tag_frequency,
+          "bucket_info": dataset.bucket_info,
+      }
+
+      subsets_metadata = []
+      for subset in dataset.subsets:
+        subset_metadata = {
+            "img_count": subset.img_count,
+            "num_repeats": subset.num_repeats,
+            "color_aug": bool(subset.color_aug),
+            "flip_aug": bool(subset.flip_aug),
+            "random_crop": bool(subset.random_crop),
+            "shuffle_caption": bool(subset.shuffle_caption),
+            "keep_tokens": subset.keep_tokens,
+        }
+
+        image_dir_or_metadata_file = None
+        if subset.image_dir:
+          image_dir = os.path.basename(subset.image_dir)
+          subset_metadata["image_dir"] = image_dir
+          image_dir_or_metadata_file = image_dir
+
+        if is_dreambooth_dataset:
+          subset_metadata["class_tokens"] = subset.class_tokens
+          subset_metadata["is_reg"] = subset.is_reg
+          if subset.is_reg:
+            image_dir_or_metadata_file = None                    # not merging reg dataset
+        else:
+          metadata_file = os.path.basename(subset.metadata_file)
+          subset_metadata["metadata_file"] = metadata_file
+          image_dir_or_metadata_file = metadata_file           # may overwrite
+
+        subsets_metadata.append(subset_metadata)
+
+        # merge dataset dir: not reg subset only
+        # TODO update additional-network extension to show detailed dataset config from metadata
+        if image_dir_or_metadata_file is not None:
+          # datasets may have a certain dir multiple times
+          v = image_dir_or_metadata_file
+          i = 2
+          while v in dataset_dirs_info:
+            v = image_dir_or_metadata_file + f" ({i})"
+            i += 1
+          image_dir_or_metadata_file = v
+
+          dataset_dirs_info[image_dir_or_metadata_file] = {
+              "n_repeats": subset.num_repeats,
+              "img_count": subset.img_count
+          }
+
+      dataset_metadata["subsets"] = subsets_metadata
+      datasets_metadata.append(dataset_metadata)
+
+      # merge tag frequency:
+      for ds_dir_name, ds_freq_for_dir in dataset.tag_frequency.items():
+        # あるディレクトリが複数のdatasetで使用されている場合、一度だけ数える
+        # もともと繰り返し回数を指定しているので、キャプション内でのタグの出現回数と、それが学習で何度使われるかは一致しない
+        # なので、ここで複数datasetの回数を合算してもあまり意味はない
+        if ds_dir_name in tag_frequency:
+          continue
+        tag_frequency[ds_dir_name] = ds_freq_for_dir
+
+    metadata["ss_datasets"] = json.dumps(datasets_metadata)
+    metadata["ss_tag_frequency"] = json.dumps(tag_frequency)
+    metadata["ss_dataset_dirs"] = json.dumps(dataset_dirs_info)
+  else:
+    # conserving backward compatibility when using train_dataset_dir and reg_dataset_dir
+    assert len(
+        train_dataset_group.datasets) == 1, f"There should be a single dataset but {len(train_dataset_group.datasets)} found. This seems to be a bug. / データセットは1個だけ存在するはずですが、実際には{len(train_dataset_group.datasets)}個でした。プログラムのバグかもしれません。"
+
+    dataset = train_dataset_group.datasets[0]
+
+    dataset_dirs_info = {}
+    reg_dataset_dirs_info = {}
+    if use_dreambooth_method:
+      for subset in dataset.subsets:
+        info = reg_dataset_dirs_info if subset.is_reg else dataset_dirs_info
+        info[os.path.basename(subset.image_dir)] = {
+            "n_repeats": subset.num_repeats,
+            "img_count": subset.img_count
+        }
+    else:
+      for subset in dataset.subsets:
+        dataset_dirs_info[os.path.basename(subset.metadata_file)] = {
+            "n_repeats": subset.num_repeats,
+            "img_count": subset.img_count
+        }
+
+    metadata.update({
+        "ss_batch_size_per_device": args.train_batch_size,
+        "ss_total_batch_size": total_batch_size,
+        "ss_resolution": args.resolution,
+        "ss_color_aug": bool(args.color_aug),
+        "ss_flip_aug": bool(args.flip_aug),
+        "ss_random_crop": bool(args.random_crop),
+        "ss_shuffle_caption": bool(args.shuffle_caption),
+        "ss_enable_bucket": bool(dataset.enable_bucket),
+        "ss_bucket_no_upscale": bool(dataset.bucket_no_upscale),
+        "ss_min_bucket_reso": dataset.min_bucket_reso,
+        "ss_max_bucket_reso": dataset.max_bucket_reso,
+        "ss_keep_tokens": args.keep_tokens,
+        "ss_dataset_dirs": json.dumps(dataset_dirs_info),
+        "ss_reg_dataset_dirs": json.dumps(reg_dataset_dirs_info),
+        "ss_tag_frequency": json.dumps(dataset.tag_frequency),
+        "ss_bucket_info": json.dumps(dataset.bucket_info),
+    })
 
   # uncomment if another network is added
   # for key, value in net_kwargs.items():
@@ -410,7 +462,7 @@ def train(args):
   loss_total = 0.0
   for epoch in range(num_train_epochs):
     print(f"epoch {epoch+1}/{num_train_epochs}")
-    train_dataset.set_current_epoch(epoch + 1)
+    train_dataset_group.set_current_epoch(epoch + 1)
 
     metadata["ss_epoch"] = str(epoch+1)
 
@@ -447,7 +499,7 @@ def train(args):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
         # Predict the noise residual
-        with autocast():
+        with accelerator.autocast():
           noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
         if args.v_parameterization:
@@ -465,9 +517,9 @@ def train(args):
         loss = loss.mean()                # 平均なのでbatch_sizeで割る必要なし
 
         accelerator.backward(loss)
-        if accelerator.sync_gradients:
+        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
           params_to_clip = network.get_trainable_params()
-          accelerator.clip_grad_norm_(params_to_clip, 1.0)  # args.max_grad_norm)
+          accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
         optimizer.step()
         lr_scheduler.step()
@@ -477,6 +529,8 @@ def train(args):
       if accelerator.sync_gradients:
         progress_bar.update(1)
         global_step += 1
+
+        train_util.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
       current_loss = loss.detach().item()
       if epoch == 0:
@@ -508,6 +562,7 @@ def train(args):
       def save_func():
         ckpt_name = train_util.EPOCH_FILE_NAME.format(model_name, epoch + 1) + '.' + args.save_model_as
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
+        metadata["ss_training_finished_at"] = str(time.time())
         print(f"saving checkpoint: {ckpt_file}")
         unwrap_model(network).save_weights(ckpt_file, save_dtype, None if args.no_metadata else metadata)
 
@@ -522,9 +577,12 @@ def train(args):
       if saving and args.save_state:
         train_util.save_state_on_epoch_end(args, accelerator, model_name, epoch + 1)
 
+    train_util.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+
     # end of epoch
 
   metadata["ss_epoch"] = str(num_train_epochs)
+  metadata["ss_training_finished_at"] = str(time.time())
 
   is_main_process = accelerator.is_main_process
   if is_main_process:
@@ -555,6 +613,8 @@ if __name__ == '__main__':
   train_util.add_sd_models_arguments(parser)
   train_util.add_dataset_arguments(parser, True, True, True)
   train_util.add_training_arguments(parser, True)
+  train_util.add_optimizer_arguments(parser)
+  config_util.add_config_arguments(parser)
 
   parser.add_argument("--no_metadata", action='store_true', help="do not save metadata in output model / メタデータを出力先モデルに保存しない")
   parser.add_argument("--save_model_as", type=str, default="safetensors", choices=[None, "ckpt", "pt", "safetensors"],
@@ -562,10 +622,6 @@ if __name__ == '__main__':
 
   parser.add_argument("--unet_lr", type=float, default=None, help="learning rate for U-Net / U-Netの学習率")
   parser.add_argument("--text_encoder_lr", type=float, default=None, help="learning rate for Text Encoder / Text Encoderの学習率")
-  parser.add_argument("--lr_scheduler_num_cycles", type=int, default=1,
-                      help="Number of restarts for cosine scheduler with restarts / cosine with restartsスケジューラでのリスタート回数")
-  parser.add_argument("--lr_scheduler_power", type=float, default=1,
-                      help="Polynomial power for polynomial scheduler / polynomialスケジューラでのpolynomial power")
 
   parser.add_argument("--network_weights", type=str, default=None,
                       help="pretrained weights for network / 学習するネットワークの初期重み")
